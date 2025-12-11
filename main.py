@@ -3,59 +3,41 @@ import os
 import uuid
 import datetime
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Body, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel, EmailStr, Field
 from dotenv import load_dotenv
-from pymongo import MongoClient, ASCENDING
+from pymongo import MongoClient, errors
 from passlib.context import CryptContext
 import jwt
-from bson import ObjectId
 
-# load env
+# load .env
 load_dotenv()
 
-# logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("backend-wedding")
-
-# config
+# ---------- Config ----------
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MASTER_DB = os.getenv("MASTER_DB", "master_db")
 JWT_SECRET = os.getenv("JWT_SECRET", "supersecret")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS", "3600"))
 
-# client (simple synchronous client)
-client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-master_db = client[MASTER_DB]
-orgs_col = master_db["organizations"]
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("backend-wedding")
 
-# ensure useful indexes
-try:
-    orgs_col.create_index([("organization_name", ASCENDING)], unique=True)
-    orgs_col.create_index([("email", ASCENDING)], unique=True)
-except Exception as e:
-    logger.warning("Could not ensure indexes: %s", e)
+# ---------- Mongo client (created on startup) ----------
+client: Optional[MongoClient] = None
+master_db = None
+orgs_col = None
 
-# password hashing: bcrypt_sha256 avoids the 72-byte bcrypt limit
+# Use bcrypt_sha256 to avoid bcrypt 72-byte limit
 pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
 
-app = FastAPI(title="Org Backend — Wedding Project")
-
-# CORS — adjust origin list in production
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Org Backend")
 
 
-# ---------------- Pydantic models ----------------
+# ---------- Pydantic models ----------
 class OrgCreateModel(BaseModel):
     organization_name: str = Field(..., min_length=3, max_length=50, pattern=r"^[A-Za-z0-9 _-]+$")
     email: EmailStr
@@ -69,9 +51,9 @@ class AdminLoginModel(BaseModel):
 
 class OrgUpdateModel(BaseModel):
     organization_name: str
-    new_organization_name: Optional[str] = Field(None, min_length=3, max_length=50, pattern=r"^[A-Za-z0-9 _-]+$")
+    new_organization_name: Optional[str] = None
     new_email: Optional[EmailStr] = None
-    new_password: Optional[str] = Field(None, min_length=8)
+    new_password: Optional[str] = None
 
 
 class OrgDeleteModel(BaseModel):
@@ -79,7 +61,7 @@ class OrgDeleteModel(BaseModel):
     admin_email: EmailStr
 
 
-# ---------------- helpers ----------------
+# ---------- Helpers ----------
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
@@ -96,9 +78,6 @@ def create_jwt(payload: dict, expires_in: int = JWT_EXPIRE_SECONDS) -> str:
     expire = datetime.datetime.utcnow() + datetime.timedelta(seconds=expires_in)
     to_encode.update({"exp": expire})
     token = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    # jwt.encode returns bytes in some PyJWT versions — ensure string
-    if isinstance(token, bytes):
-        token = token.decode("utf-8")
     return token
 
 
@@ -106,8 +85,11 @@ def normalize_name(name: str) -> str:
     return "".join(c for c in name.lower() if c.isalnum() or c == "_").replace(" ", "_")
 
 
-def serialize_mongo(doc: Dict[str, Any]) -> Dict[str, Any]:
-    new_doc: Dict[str, Any] = {}
+from bson import ObjectId
+
+
+def serialize_mongo(doc):
+    new_doc = {}
     for k, v in doc.items():
         if isinstance(v, ObjectId):
             new_doc[k] = str(v)
@@ -118,10 +100,57 @@ def serialize_mongo(doc: Dict[str, Any]) -> Dict[str, Any]:
     return new_doc
 
 
-# ---------------- routes ----------------
+# ---------- Startup & Shutdown ----------
+@app.on_event("startup")
+def on_startup():
+    global client, master_db, orgs_col
+    try:
+        logger.info("Trying to connect to MongoDB: %s", MONGO_URI)
+        # short timeout so startup fails fast if Mongo is unreachable
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, tls=True)
+        # verify connection
+        info = client.server_info()
+        logger.info("Connected to MongoDB, version=%s", info.get("version"))
+        master_db = client[MASTER_DB]
+        orgs_col = master_db["organizations"]
+        app.state.mongo_ok = True
+    except Exception as e:
+        logger.exception("MongoDB connection failed on startup: %s", e)
+        app.state.mongo_ok = False
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    global client
+    try:
+        if client:
+            client.close()
+            logger.info("Closed MongoDB connection")
+    except Exception:
+        logger.exception("Error closing MongoDB connection")
+
+
+# ---------- Routes ----------
+@app.get("/health")
+def health():
+    """
+    Health endpoint: returns app + db status and some diagnostics.
+    """
+    db_status = getattr(app.state, "mongo_ok", False)
+    return {
+        "ok": db_status,
+        "app": "ok",
+        "mongo_connected": db_status,
+        "master_db": MASTER_DB,
+    }
+
+
 @app.post("/org/create")
 def create_org(data: OrgCreateModel = Body(...)):
     try:
+        if not getattr(app.state, "mongo_ok", False):
+            raise HTTPException(status_code=503, detail="MongoDB not connected")
+
         if orgs_col.find_one({"organization_name": data.organization_name}):
             raise HTTPException(status_code=400, detail="Organization with that name already exists")
         if orgs_col.find_one({"email": data.email}):
@@ -141,17 +170,21 @@ def create_org(data: OrgCreateModel = Body(...)):
         }
 
         orgs_col.insert_one(org_doc)
+
         return {"ok": True, "org_id": org_id, "collection_name": collection_name}
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("create_org error")
+        logger.exception("Error in create_org: %s", e)
         raise HTTPException(status_code=500, detail=f"Internal server error: {repr(e)}")
 
 
 @app.post("/admin/login")
 def admin_login(data: AdminLoginModel = Body(...)):
     try:
+        if not getattr(app.state, "mongo_ok", False):
+            raise HTTPException(status_code=503, detail="MongoDB not connected")
+
         admin = orgs_col.find_one({"email": data.email})
         if not admin:
             raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -165,27 +198,36 @@ def admin_login(data: AdminLoginModel = Body(...)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("admin_login error")
+        logger.exception("Error in admin_login: %s", e)
         raise HTTPException(status_code=500, detail=f"Internal server error: {repr(e)}")
 
 
 @app.get("/org/get")
 def get_org(organization_name: str):
     try:
+        if not getattr(app.state, "mongo_ok", False):
+            raise HTTPException(status_code=503, detail="MongoDB not connected")
+
         org = orgs_col.find_one({"organization_name": organization_name}, {"password_hash": 0})
         if not org:
             raise HTTPException(status_code=404, detail="Organization not found")
-        return {"ok": True, "organization": serialize_mongo(org)}
+
+        org = serialize_mongo(org)
+        return {"ok": True, "organization": org}
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("get_org error")
+        logger.exception("Error in get_org: %s", e)
         raise HTTPException(status_code=500, detail=f"Internal server error: {repr(e)}")
 
 
 @app.put("/org/update")
 def update_org(data: OrgUpdateModel = Body(...)):
     try:
+        if not getattr(app.state, "mongo_ok", False):
+            raise HTTPException(status_code=503, detail="MongoDB not connected")
+
         org = orgs_col.find_one({"organization_name": data.organization_name})
         if not org:
             raise HTTPException(status_code=404, detail="Organization not found")
@@ -209,13 +251,16 @@ def update_org(data: OrgUpdateModel = Body(...)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("update_org error")
+        logger.exception("Error in update_org: %s", e)
         raise HTTPException(status_code=500, detail=f"Internal server error: {repr(e)}")
 
 
 @app.delete("/org/delete")
 def delete_org(data: OrgDeleteModel = Body(...)):
     try:
+        if not getattr(app.state, "mongo_ok", False):
+            raise HTTPException(status_code=503, detail="MongoDB not connected")
+
         org = orgs_col.find_one({"organization_name": data.organization_name})
         if not org:
             raise HTTPException(status_code=404, detail="Organization not found")
@@ -232,7 +277,7 @@ def delete_org(data: OrgDeleteModel = Body(...)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("delete_org error")
+        logger.exception("Error in delete_org: %s", e)
         raise HTTPException(status_code=500, detail=f"Internal server error: {repr(e)}")
 
 
