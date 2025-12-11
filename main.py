@@ -3,62 +3,63 @@ import os
 import uuid
 import datetime
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Body, Request, status
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from dotenv import load_dotenv
-from pymongo import MongoClient, errors
+from pymongo import MongoClient, ASCENDING
 from passlib.context import CryptContext
 import jwt
 from bson import ObjectId
 
-# Load env
+# load env
 load_dotenv()
 
-# -------- Configuration ----------
+# logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("backend-wedding")
+
+# config
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MASTER_DB = os.getenv("MASTER_DB", "master_db")
 JWT_SECRET = os.getenv("JWT_SECRET", "supersecret")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS", "3600"))
 
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("backend-wedding")
-
-# Mongo client
-try:
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    client.server_info()  # quick check to raise early if unreachable
-except Exception as e:
-    logger.error("Cannot connect to MongoDB: %s", e)
-    # We continue to start app; endpoints will return errors if DB unreachable.
-
+# client (simple synchronous client)
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 master_db = client[MASTER_DB]
 orgs_col = master_db["organizations"]
 
-# Use bcrypt_sha256 to avoid bcrypt 72-byte truncation issues
+# ensure useful indexes
+try:
+    orgs_col.create_index([("organization_name", ASCENDING)], unique=True)
+    orgs_col.create_index([("email", ASCENDING)], unique=True)
+except Exception as e:
+    logger.warning("Could not ensure indexes: %s", e)
+
+# password hashing: bcrypt_sha256 avoids the 72-byte bcrypt limit
 pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
 
-app = FastAPI(title="Org Backend - Wedding Project", version="1.0.0")
+app = FastAPI(title="Org Backend — Wedding Project")
 
-# CORS (adjust origins if required)
+# CORS — adjust origin list in production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For dev. In prod, restrict origins.
+    allow_origins=["*"],  # tighten for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Pydantic models ----------
+
+# ---------------- Pydantic models ----------------
 class OrgCreateModel(BaseModel):
-    organization_name: str = Field(..., min_length=2, max_length=100)
+    organization_name: str = Field(..., min_length=3, max_length=50, pattern=r"^[A-Za-z0-9 _-]+$")
     email: EmailStr
-    password: str = Field(..., min_length=6)
+    password: str = Field(..., min_length=8)
 
 
 class AdminLoginModel(BaseModel):
@@ -68,9 +69,9 @@ class AdminLoginModel(BaseModel):
 
 class OrgUpdateModel(BaseModel):
     organization_name: str
-    new_organization_name: Optional[str] = None
+    new_organization_name: Optional[str] = Field(None, min_length=3, max_length=50, pattern=r"^[A-Za-z0-9 _-]+$")
     new_email: Optional[EmailStr] = None
-    new_password: Optional[str] = None
+    new_password: Optional[str] = Field(None, min_length=8)
 
 
 class OrgDeleteModel(BaseModel):
@@ -78,16 +79,7 @@ class OrgDeleteModel(BaseModel):
     admin_email: EmailStr
 
 
-# ---------- Helpers ----------
-def normalize_name(name: str) -> str:
-    # produce a safe collection name. keep alnum + underscores
-    s = "".join(c if (c.isalnum() or c == "_") else "_" for c in name.strip().lower())
-    # collapse multiple underscores
-    while "__" in s:
-        s = s.replace("__", "_")
-    return s[:80]  # limit length
-
-
+# ---------------- helpers ----------------
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
@@ -104,11 +96,18 @@ def create_jwt(payload: dict, expires_in: int = JWT_EXPIRE_SECONDS) -> str:
     expire = datetime.datetime.utcnow() + datetime.timedelta(seconds=expires_in)
     to_encode.update({"exp": expire})
     token = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    # jwt.encode returns bytes in some PyJWT versions — ensure string
+    if isinstance(token, bytes):
+        token = token.decode("utf-8")
     return token
 
 
-def serialize_mongo(doc):
-    new_doc = {}
+def normalize_name(name: str) -> str:
+    return "".join(c for c in name.lower() if c.isalnum() or c == "_").replace(" ", "_")
+
+
+def serialize_mongo(doc: Dict[str, Any]) -> Dict[str, Any]:
+    new_doc: Dict[str, Any] = {}
     for k, v in doc.items():
         if isinstance(v, ObjectId):
             new_doc[k] = str(v)
@@ -119,45 +118,18 @@ def serialize_mongo(doc):
     return new_doc
 
 
-# ---------- Global exception handler ----------
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.exception("Unhandled error for %s %s: %s", request.method, request.url, exc)
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": f"Internal server error: {repr(exc)}"},
-    )
-
-
-# ---------- Routes ----------
-@app.get("/health")
-def health():
-    """Simple health check for readiness / liveness."""
-    try:
-        client.admin.command("ping")
-        return {"ok": True, "db": "reachable"}
-    except Exception as e:
-        logger.warning("Health check DB ping failed: %s", e)
-        return JSONResponse(status_code=503, content={"ok": False, "db": "unreachable", "detail": str(e)})
-
-
+# ---------------- routes ----------------
 @app.post("/org/create")
 def create_org(data: OrgCreateModel = Body(...)):
     try:
-        # uniqueness checks
         if orgs_col.find_one({"organization_name": data.organization_name}):
             raise HTTPException(status_code=400, detail="Organization with that name already exists")
         if orgs_col.find_one({"email": data.email}):
             raise HTTPException(status_code=400, detail="Admin email already used")
 
-        collection_name = f"org_{normalize_name(data.organization_name)}"
-
-        # create a new collection (this will create on first insert; we can create explicitly)
-        if collection_name not in master_db.list_collection_names():
-            master_db.create_collection(collection_name)
-
         hashed_pw = hash_password(data.password)
         org_id = str(uuid.uuid4())
+        collection_name = f"org_{normalize_name(data.organization_name)}"
 
         org_doc = {
             "org_id": org_id,
@@ -169,16 +141,12 @@ def create_org(data: OrgCreateModel = Body(...)):
         }
 
         orgs_col.insert_one(org_doc)
-
-        logger.info("Created org %s with collection %s", data.organization_name, collection_name)
         return {"ok": True, "org_id": org_id, "collection_name": collection_name}
     except HTTPException:
         raise
-    except errors.PyMongoError as e:
-        logger.error("MongoDB error on create_org: %s", e)
-        raise HTTPException(status_code=500, detail="Database error")
     except Exception as e:
-        raise
+        logger.exception("create_org error")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {repr(e)}")
 
 
 @app.post("/admin/login")
@@ -196,8 +164,9 @@ def admin_login(data: AdminLoginModel = Body(...)):
         return {"ok": True, "token": token}
     except HTTPException:
         raise
-    except Exception:
-        raise
+    except Exception as e:
+        logger.exception("admin_login error")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {repr(e)}")
 
 
 @app.get("/org/get")
@@ -209,8 +178,9 @@ def get_org(organization_name: str):
         return {"ok": True, "organization": serialize_mongo(org)}
     except HTTPException:
         raise
-    except Exception:
-        raise
+    except Exception as e:
+        logger.exception("get_org error")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {repr(e)}")
 
 
 @app.put("/org/update")
@@ -222,21 +192,12 @@ def update_org(data: OrgUpdateModel = Body(...)):
 
         update_fields = {}
         if data.new_organization_name:
-            # check uniqueness
-            if orgs_col.find_one({"organization_name": data.new_organization_name}):
-                raise HTTPException(status_code=400, detail="New organization name already exists")
-            new_col = f"org_{normalize_name(data.new_organization_name)}"
-            # create new collection and (optionally) move data - here we just create the collection
-            if new_col not in master_db.list_collection_names():
-                master_db.create_collection(new_col)
             update_fields["organization_name"] = data.new_organization_name
-            update_fields["collection_name"] = new_col
-
+            update_fields["collection_name"] = f"org_{normalize_name(data.new_organization_name)}"
         if data.new_email:
             if orgs_col.find_one({"email": data.new_email, "organization_name": {"$ne": data.organization_name}}):
                 raise HTTPException(status_code=400, detail="Email already in use")
             update_fields["email"] = data.new_email
-
         if data.new_password:
             update_fields["password_hash"] = hash_password(data.new_password)
 
@@ -247,8 +208,9 @@ def update_org(data: OrgUpdateModel = Body(...)):
         return {"ok": True, "updated": update_fields}
     except HTTPException:
         raise
-    except Exception:
-        raise
+    except Exception as e:
+        logger.exception("update_org error")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {repr(e)}")
 
 
 @app.delete("/org/delete")
@@ -269,11 +231,11 @@ def delete_org(data: OrgDeleteModel = Body(...)):
         return {"ok": True, "deleted": data.organization_name}
     except HTTPException:
         raise
-    except Exception:
-        raise
+    except Exception as e:
+        logger.exception("delete_org error")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {repr(e)}")
 
 
 @app.get("/")
 def root():
     return {"ok": True, "msg": "Backend running. Use /docs for API docs."}
-
