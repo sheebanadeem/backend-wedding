@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+.vscode/
+venv/
+.venv/
+test_mongo.py
