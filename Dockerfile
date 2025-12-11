@@ -1,5 +1,6 @@
 # Dockerfile
 FROM python:3.11-slim
+RUN apt-get update && apt-get install -y ca-certificates && update-ca-certificates
 
 # Install system deps for bcrypt and general utilities
 RUN apt-get update && apt-get install -y --no-install-recommends \
